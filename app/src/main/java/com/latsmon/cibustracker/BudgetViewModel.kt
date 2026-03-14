@@ -20,6 +20,9 @@ class BudgetViewModel(application: Application) : AndroidViewModel(application) 
     private val _monthlyBudget = MutableStateFlow(prefs.getFloat("monthly_budget", 1200f).toDouble())
     val monthlyBudget: StateFlow<Double> = _monthlyBudget
 
+    private val _dailyLimit = MutableStateFlow(prefs.getFloat("daily_limit", 200f).toDouble())
+    val dailyLimit: StateFlow<Double> = _dailyLimit
+
     private val _notificationHour = MutableStateFlow(prefs.getInt("notification_hour", 9))
     val notificationHour: StateFlow<Int> = _notificationHour
 
@@ -80,18 +83,18 @@ class BudgetViewModel(application: Application) : AndroidViewModel(application) 
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0.0)
 
     val minimumToSpendToday: StateFlow<Double> = combine(
-        remainingBalance, _workingDays, _monthStartDay
-    ) { remaining, workDays, startDay ->
+        remainingBalance, _workingDays, _monthStartDay, _dailyLimit
+    ) { remaining, workDays, startDay, limit ->
         val workingDaysLeft = countWorkingDaysLeft(workDays, startDay)
         if (workingDaysLeft <= 0) return@combine 0.0
-        val minimum = remaining - (workingDaysLeft - 1) * 200.0
-        minimum.coerceIn(0.0, 200.0)
+        val minimum = remaining - (workingDaysLeft - 1) * limit
+        minimum.coerceIn(0.0, limit)
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0.0)
 
     fun addSpend(amount: Double): String? {
         val currentRemaining = remainingBalance.value
         val currentTodaySpent = todaySpent.value
-        val todayLeft = 200.0 - currentTodaySpent
+        val todayLeft = _dailyLimit.value - currentTodaySpent
 
         return when {
             amount > currentRemaining -> "Cannot spend ₪%.0f — only ₪%.0f left this month".format(amount, currentRemaining)
@@ -139,5 +142,10 @@ class BudgetViewModel(application: Application) : AndroidViewModel(application) 
             date = date.plusDays(1)
         }
         return count
+    }
+
+    fun saveDailyLimit(limit: Double) {
+        prefs.edit().putFloat("daily_limit", limit.toFloat()).apply()
+        _dailyLimit.value = limit
     }
 }

@@ -2,19 +2,24 @@ package com.latsmon.cibustracker
 
 import android.content.Context
 import androidx.room.*
+import androidx.room.migration.Migration
 import kotlinx.coroutines.flow.Flow
 
 @Entity(tableName = "spends")
 data class Spend(
     @PrimaryKey(autoGenerate = true) val id: Int = 0,
     val amount: Double,
-    val timestamp: Long = System.currentTimeMillis()
+    val timestamp: Long = System.currentTimeMillis(),
+    val businessName: String? = null
 )
 
 @Dao
 interface SpendDao {
     @Insert
     suspend fun insert(spend: Spend)
+
+    @Insert
+    fun insertBlocking(spend: Spend)
 
     @Delete
     suspend fun delete(spend: Spend)
@@ -32,7 +37,7 @@ interface SpendDao {
     suspend fun deleteAll()
 }
 
-@Database(entities = [Spend::class], version = 1)
+@Database(entities = [Spend::class], version = 2)
 abstract class BudgetDatabase : RoomDatabase() {
     abstract fun spendDao(): SpendDao
 
@@ -45,7 +50,15 @@ abstract class BudgetDatabase : RoomDatabase() {
                     context.applicationContext,
                     BudgetDatabase::class.java,
                     "budget_database"
-                ).build().also { INSTANCE = it }
+                )
+                    .addMigrations(MIGRATION_1_2)
+                    .build().also { INSTANCE = it }
+            }
+        }
+
+        val MIGRATION_1_2: Migration = object : Migration(1, 2) {
+            override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE spends ADD COLUMN businessName TEXT")
             }
         }
     }

@@ -1,12 +1,15 @@
 package com.latsmon.cibustracker
 
 import android.Manifest
+import android.accounts.AccountManager
+import android.app.Activity
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
@@ -23,10 +26,17 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
-import androidx.compose.material3.Slider
 import androidx.work.*
+import com.google.android.gms.auth.api.signin.GoogleSignIn
+import com.google.android.gms.auth.api.signin.GoogleSignInOptions
+import com.google.android.gms.common.api.Scope
+import com.google.api.services.gmail.GmailScopes
 import java.text.SimpleDateFormat
 import java.time.DayOfWeek
 import java.time.LocalDateTime
@@ -299,6 +309,7 @@ fun CibusApp(vm: BudgetViewModel = viewModel()) {
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SettingsDialog(
     vm: BudgetViewModel,
@@ -306,6 +317,9 @@ fun SettingsDialog(
     onReschedule: (Int, Int) -> Unit,
     onForceNotification: () -> Unit
 ) {
+    val context = LocalContext.current
+    val prefs = context.getSharedPreferences("cibus_prefs", Context.MODE_PRIVATE)
+
     val monthStartDay by vm.monthStartDay.collectAsState()
     val monthlyBudget by vm.monthlyBudget.collectAsState()
     val notificationHour by vm.notificationHour.collectAsState()
@@ -314,13 +328,33 @@ fun SettingsDialog(
 
     var dayInput by remember { mutableStateOf(monthStartDay.toString()) }
     var budgetInput by remember { mutableStateOf(monthlyBudget.toInt().toString()) }
+    var dailyLimitInput by remember { mutableStateOf(vm.dailyLimit.value.toInt().toString()) }
     var hourInput by remember { mutableStateOf(notificationHour.toString()) }
     var minuteInput by remember { mutableStateOf(notificationMinute.toString().padStart(2, '0')) }
     var selectedDays by remember { mutableStateOf(workingDays) }
     var showResetConfirm by remember { mutableStateOf(false) }
     var savedMessage by remember { mutableStateOf("") }
 
-    // All days in display order with short labels
+    var gmailAccount by remember {
+        mutableStateOf(prefs.getString("gmail_account", null))
+    }
+
+    val signInLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            val data = result.data
+            val accountName = data?.getStringExtra(AccountManager.KEY_ACCOUNT_NAME)
+                ?: GoogleSignIn.getLastSignedInAccount(context)?.email
+            if (accountName != null) {
+                prefs.edit().putString("gmail_account", accountName).apply()
+                gmailAccount = accountName
+                scheduleGmailPolling(context)
+                savedMessage = "Gmail connected: $accountName"
+            }
+        }
+    }
+
     val allDays = listOf(
         DayOfWeek.SUNDAY to "Sun",
         DayOfWeek.MONDAY to "Mon",
@@ -331,47 +365,170 @@ fun SettingsDialog(
         DayOfWeek.SATURDAY to "Sat"
     )
 
-    AlertDialog(
+    ModalBottomSheet(
         onDismissRequest = onDismiss,
-        title = { Text("Settings") },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    ) {
+        Column(
+            modifier = Modifier.fillMaxSize()
+        ) {
+            // Title
+            Text(
+                "Settings",
+                style = MaterialTheme.typography.headlineSmall,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+            )
 
-                // Month start day
-                Text("Month start day (1–31)", style = MaterialTheme.typography.labelMedium)
-                OutlinedTextField(
-                    value = dayInput,
-                    onValueChange = { dayInput = it },
-                    label = { Text("Day of month") },
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
+            HorizontalDivider()
 
-                // Monthly budget
-                Text("Monthly budget (₪)", style = MaterialTheme.typography.labelMedium)
+            // Scrollable content
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .verticalScroll(rememberScrollState())
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
+
+                // Gmail integration
+                Text("Gmail integration", style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold)
+
+                if (gmailAccount != null) {
+                    Text(
+                        "Connected: $gmailAccount",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(
+                            onClick = {
+                                WorkManager.getInstance(context).enqueue(
+                                    OneTimeWorkRequestBuilder<GmailPollingWorker>().build()
+                                )
+                                savedMessage = "Polling Gmail now..."
+                            },
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("Poll now", fontSize = 12.sp)
+                        }
+                        OutlinedButton(
+                            onClick = {
+                                prefs.edit()
+                                    .remove("gmail_account")
+                                    .remove("last_email_id")
+                                    .apply()
+                                gmailAccount = null
+                                cancelGmailPolling(context)
+                                val gso = GoogleSignInOptions.Builder(
+                                    GoogleSignInOptions.DEFAULT_SIGN_IN).build()
+                                GoogleSignIn.getClient(context, gso).signOut()
+                                savedMessage = "Gmail disconnected"
+                            },
+                            modifier = Modifier.weight(1f),
+                            colors = ButtonDefaults.outlinedButtonColors(
+                                contentColor = MaterialTheme.colorScheme.error
+                            )
+                        ) {
+                            Text("Disconnect", fontSize = 12.sp)
+                        }
+                    }
+                } else {
+                    Button(
+                        onClick = {
+                            val gso = GoogleSignInOptions.Builder(GoogleSignInOptions.DEFAULT_SIGN_IN)
+                                .requestEmail()
+                                .requestScopes(Scope(GmailScopes.GMAIL_READONLY))
+                                .requestServerAuthCode(
+                                    "582879497056-uiu4iljpi4sf8qbudn5qgok3fununmcm.apps.googleusercontent.com"
+                                )
+                                .build()
+                            val signInIntent = GoogleSignIn.getClient(context, gso).signInIntent
+                            signInLauncher.launch(signInIntent)
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Connect Gmail account")
+                    }
+                }
+
+                HorizontalDivider()
+
+                // Budget settings
+                Text("Budget", style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold)
+
                 OutlinedTextField(
                     value = budgetInput,
                     onValueChange = { budgetInput = it },
-                    label = { Text("Budget") },
+                    label = { Text("Monthly budget (₪)") },
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
 
-// Notification time
-                Text("Notification time", style = MaterialTheme.typography.labelMedium)
+                OutlinedTextField(
+                    value = dailyLimitInput,
+                    onValueChange = { dailyLimitInput = it },
+                    label = { Text("Daily spending limit (₪)") },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
 
-                val timeDisplay = "%02d:%02d".format(hourInput.toIntOrNull() ?: 9, minuteInput.toIntOrNull() ?: 0)
+                OutlinedTextField(
+                    value = dayInput,
+                    onValueChange = { dayInput = it },
+                    label = { Text("Month start day (1–31)") },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                HorizontalDivider()
+
+                // Working days
+                Text("Working days", style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold)
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    allDays.forEach { (day, label) ->
+                        val selected = day in selectedDays
+                        FilterChip(
+                            selected = selected,
+                            onClick = {
+                                selectedDays = if (selected)
+                                    selectedDays - day
+                                else
+                                    selectedDays + day
+                            },
+                            label = { Text(label, fontSize = 11.sp) },
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                }
+
+                HorizontalDivider()
+
+                // Notification time
+                Text("Notification time", style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold)
+
                 Text(
-                    timeDisplay,
+                    "%02d:%02d".format(
+                        hourInput.toIntOrNull() ?: 9,
+                        minuteInput.toIntOrNull() ?: 0
+                    ),
                     style = MaterialTheme.typography.headlineMedium,
                     fontWeight = FontWeight.Bold,
                     modifier = Modifier.fillMaxWidth(),
                     textAlign = TextAlign.Center
                 )
 
-// Hour slider + input
                 Text("Hour", style = MaterialTheme.typography.bodySmall)
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
@@ -396,7 +553,6 @@ fun SettingsDialog(
                     )
                 }
 
-                // Minute slider + input
                 Text("Minute", style = MaterialTheme.typography.bodySmall)
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
@@ -404,7 +560,9 @@ fun SettingsDialog(
                 ) {
                     Slider(
                         value = (minuteInput.toIntOrNull() ?: 0).toFloat(),
-                        onValueChange = { minuteInput = it.toInt().toString().padStart(2, '0') },
+                        onValueChange = {
+                            minuteInput = it.toInt().toString().padStart(2, '0')
+                        },
                         valueRange = 0f..59f,
                         steps = 58,
                         modifier = Modifier.weight(1f)
@@ -421,58 +579,11 @@ fun SettingsDialog(
                     )
                 }
 
-                // Working days selector
-                Text("Working days", style = MaterialTheme.typography.labelMedium)
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(4.dp)
-                ) {
-                    allDays.forEach { (day, label) ->
-                        val selected = day in selectedDays
-                        FilterChip(
-                            selected = selected,
-                            onClick = {
-                                selectedDays = if (selected)
-                                    selectedDays - day
-                                else
-                                    selectedDays + day
-                            },
-                            label = { Text(label, fontSize = 11.sp) },
-                            modifier = Modifier.weight(1f)
-                        )
-                    }
-                }
-
-                // Save button
-                Button(
-                    onClick = {
-                        val day = dayInput.toIntOrNull()?.coerceIn(1, 31)
-                        val budget = budgetInput.toDoubleOrNull()
-                        val hour = hourInput.toIntOrNull()?.coerceIn(0, 23)
-                        val minute = minuteInput.toIntOrNull()?.coerceIn(0, 59)
-                        if (day != null) vm.saveMonthStartDay(day)
-                        if (budget != null) vm.saveMonthlyBudget(budget)
-                        if (hour != null && minute != null) {
-                            vm.saveNotificationTime(hour, minute)
-                            onReschedule(hour, minute)
-                        }
-                        if (selectedDays.isNotEmpty()) vm.saveWorkingDays(selectedDays)
-                        savedMessage = "Settings saved!"
-                    },
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text("Save settings")
-                }
-
-                if (savedMessage.isNotEmpty()) {
-                    Text(
-                        savedMessage,
-                        color = MaterialTheme.colorScheme.primary,
-                        style = MaterialTheme.typography.bodySmall
-                    )
-                }
-
                 HorizontalDivider()
+
+                // Test & reset
+                Text("Tools", style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold)
 
                 OutlinedButton(
                     onClick = onForceNotification,
@@ -490,12 +601,59 @@ fun SettingsDialog(
                 ) {
                     Text("Reset all spending")
                 }
+
+                if (savedMessage.isNotEmpty()) {
+                    Text(
+                        savedMessage,
+                        color = MaterialTheme.colorScheme.primary,
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.fillMaxWidth(),
+                        textAlign = TextAlign.Center
+                    )
+                }
+
+                // Bottom padding so last item isn't hidden behind buttons
+                Spacer(Modifier.height(8.dp))
             }
-        },
-        confirmButton = {
-            TextButton(onClick = onDismiss) { Text("Close") }
+
+            // Always-visible bottom bar
+            HorizontalDivider()
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                OutlinedButton(
+                    onClick = onDismiss,
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text("Cancel")
+                }
+                Button(
+                    onClick = {
+                        val day = dayInput.toIntOrNull()?.coerceIn(1, 31)
+                        val budget = budgetInput.toDoubleOrNull()
+                        val dailyLimit = dailyLimitInput.toDoubleOrNull()
+                        val hour = hourInput.toIntOrNull()?.coerceIn(0, 23)
+                        val minute = minuteInput.toIntOrNull()?.coerceIn(0, 59)
+                        if (day != null) vm.saveMonthStartDay(day)
+                        if (budget != null) vm.saveMonthlyBudget(budget)
+                        if (dailyLimit != null && dailyLimit > 0) vm.saveDailyLimit(dailyLimit)
+                        if (hour != null && minute != null) {
+                            vm.saveNotificationTime(hour, minute)
+                            onReschedule(hour, minute)
+                        }
+                        if (selectedDays.isNotEmpty()) vm.saveWorkingDays(selectedDays)
+                        onDismiss()
+                    },
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text("Save & Close")
+                }
+            }
         }
-    )
+    }
 
     if (showResetConfirm) {
         AlertDialog(
@@ -535,11 +693,21 @@ fun SpendRow(spend: Spend, onDelete: () -> Unit) {
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Text(
-                formatter.format(Date(spend.timestamp)),
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    formatter.format(Date(spend.timestamp)),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                if (spend.businessName != null) {
+                    Text(
+                        spend.businessName,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+            }
             Text(
                 "₪%.0f".format(spend.amount),
                 fontWeight = FontWeight.SemiBold,
