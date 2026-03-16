@@ -9,6 +9,12 @@ import java.time.LocalDate
 import java.time.ZoneId
 import java.time.DayOfWeek
 
+data class MonthPeriod(
+    val label: String,
+    val start: Long,
+    val end: Long
+)
+
 class BudgetViewModel(application: Application) : AndroidViewModel(application) {
 
     private val dao = BudgetDatabase.getDatabase(application).spendDao()
@@ -20,8 +26,10 @@ class BudgetViewModel(application: Application) : AndroidViewModel(application) 
     private val _monthlyBudget = MutableStateFlow(prefs.getFloat("monthly_budget", 1200f).toDouble())
     val monthlyBudget: StateFlow<Double> = _monthlyBudget
 
-    private val _dailyLimit = MutableStateFlow(prefs.getFloat("daily_limit", 200f).toDouble())
-    val dailyLimit: StateFlow<Double> = _dailyLimit
+    private val _dailyLimit = MutableStateFlow(
+        prefs.getFloat("daily_limit", -1f).let { if (it < 0) null else it.toDouble() }
+    )
+    val dailyLimit: StateFlow<Double?> = _dailyLimit
 
     private val _notificationHour = MutableStateFlow(prefs.getInt("notification_hour", 9))
     val notificationHour: StateFlow<Int> = _notificationHour
@@ -29,16 +37,19 @@ class BudgetViewModel(application: Application) : AndroidViewModel(application) 
     private val _notificationMinute = MutableStateFlow(prefs.getInt("notification_minute", 0))
     val notificationMinute: StateFlow<Int> = _notificationMinute
 
-    // Working days stored as a set of DayOfWeek ordinals (1=Mon ... 7=Sun)
     private val _workingDays = MutableStateFlow(loadWorkingDays())
     val workingDays: StateFlow<Set<DayOfWeek>> = _workingDays
+
+    fun saveDailyLimit(limit: Double?) {
+        prefs.edit().putFloat("daily_limit", limit?.toFloat() ?: -1f).apply()
+        _dailyLimit.value = limit
+    }
 
     private fun loadWorkingDays(): Set<DayOfWeek> {
         val saved = prefs.getStringSet("working_days", null)
         return if (saved != null) {
             saved.mapNotNull { runCatching { DayOfWeek.valueOf(it) }.getOrNull() }.toSet()
         } else {
-            // Default: Sunday to Thursday
             setOf(DayOfWeek.SUNDAY, DayOfWeek.MONDAY, DayOfWeek.TUESDAY, DayOfWeek.WEDNESDAY, DayOfWeek.THURSDAY)
         }
     }
@@ -56,6 +67,11 @@ class BudgetViewModel(application: Application) : AndroidViewModel(application) 
     fun saveMonthlyBudget(budget: Double) {
         prefs.edit().putFloat("monthly_budget", budget.toFloat()).apply()
         _monthlyBudget.value = budget
+    }
+
+    fun saveDailyLimit(limit: Double) {
+        prefs.edit().putFloat("daily_limit", limit.toFloat()).apply()
+        _dailyLimit.value = limit
     }
 
     fun saveNotificationTime(hour: Int, minute: Int) {
@@ -87,23 +103,76 @@ class BudgetViewModel(application: Application) : AndroidViewModel(application) 
     ) { remaining, workDays, startDay, limit ->
         val workingDaysLeft = countWorkingDaysLeft(workDays, startDay)
         if (workingDaysLeft <= 0) return@combine 0.0
-        val minimum = remaining - (workingDaysLeft - 1) * limit
-        minimum.coerceIn(0.0, limit)
+        val effectiveLimit = limit ?: remaining
+        val minimum = remaining - (workingDaysLeft - 1) * effectiveLimit
+        minimum.coerceIn(0.0, effectiveLimit)
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0.0)
 
-    fun addSpend(amount: Double): String? {
+    // All months that have spend data
+    val availableMonths: StateFlow<List<MonthPeriod>> =
+        dao.getEarliestSpendTimestamp().map { earliest ->
+            if (earliest == null) return@map emptyList()
+            buildMonthList(earliest)
+        }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    fun addSpend(amount: Double, timestamp: Long = System.currentTimeMillis()): String? {
         val currentRemaining = remainingBalance.value
         val currentTodaySpent = todaySpent.value
-        val todayLeft = _dailyLimit.value - currentTodaySpent
+        val limit = _dailyLimit.value
 
         return when {
             amount > currentRemaining -> "Cannot spend ₪%.0f — only ₪%.0f left this month".format(amount, currentRemaining)
-            amount > todayLeft -> "Cannot spend ₪%.0f — only ₪%.0f left for today".format(amount, todayLeft)
+            limit != null && amount > (limit - currentTodaySpent) ->
+                "Cannot spend ₪%.0f — only ₪%.0f left for today".format(amount, limit - currentTodaySpent)
             else -> {
-                viewModelScope.launch { dao.insert(Spend(amount = amount)) }
+                viewModelScope.launch { dao.insert(Spend(amount = amount, timestamp = timestamp)) }
                 null
             }
         }
+    }
+    private fun buildMonthList(earliestTimestamp: Long): List<MonthPeriod> {
+        val startDay = _monthStartDay.value
+        val today = LocalDate.now()
+        val earliest = java.time.Instant.ofEpochMilli(earliestTimestamp)
+            .atZone(ZoneId.systemDefault()).toLocalDate()
+
+        val months = mutableListOf<MonthPeriod>()
+        var cursor = today
+
+        while (!cursor.isBefore(earliest)) {
+            val periodStart = if (cursor.dayOfMonth >= startDay)
+                cursor.withDayOfMonth(startDay)
+            else
+                cursor.minusMonths(1).withDayOfMonth(startDay)
+
+            val periodEnd = periodStart.plusMonths(1).withDayOfMonth(startDay - 1)
+
+            val startMillis = periodStart.atStartOfDay(ZoneId.systemDefault()).toInstant().toEpochMilli()
+            val endMillis = periodEnd.plusDays(1).atStartOfDay(ZoneId.systemDefault()).toInstant().toEpochMilli()
+
+            val label = "%d %s – %d %s".format(
+                periodStart.dayOfMonth,
+                periodStart.month.name.lowercase().replaceFirstChar { it.uppercase() }.take(3),
+                periodEnd.dayOfMonth,
+                periodEnd.month.name.lowercase().replaceFirstChar { it.uppercase() }.take(3)
+            )
+
+            if (months.none { it.start == startMillis }) {
+                months.add(MonthPeriod(label, startMillis, endMillis))
+            }
+
+            cursor = periodStart.minusDays(1)
+        }
+
+        return months
+    }
+
+    fun getSpendsBetween(start: Long, end: Long): Flow<List<Spend>> =
+        dao.getSpendsBetween(start, end)
+
+    fun addSpendToMonth(amount: Double, timestamp: Long): String? {
+        viewModelScope.launch { dao.insert(Spend(amount = amount, timestamp = timestamp)) }
+        return null
     }
 
     fun deleteSpend(spend: Spend) {
@@ -128,7 +197,10 @@ class BudgetViewModel(application: Application) : AndroidViewModel(application) 
         return LocalDate.now().atStartOfDay(ZoneId.systemDefault()).toInstant().toEpochMilli()
     }
 
-    fun countWorkingDaysLeft(workDays: Set<DayOfWeek> = _workingDays.value, startDay: Int = _monthStartDay.value): Int {
+    fun countWorkingDaysLeft(
+        workDays: Set<DayOfWeek> = _workingDays.value,
+        startDay: Int = _monthStartDay.value
+    ): Int {
         val today = LocalDate.now()
         val monthEnd = if (today.dayOfMonth >= startDay)
             today.plusMonths(1).withDayOfMonth(startDay - 1)
@@ -142,10 +214,5 @@ class BudgetViewModel(application: Application) : AndroidViewModel(application) 
             date = date.plusDays(1)
         }
         return count
-    }
-
-    fun saveDailyLimit(limit: Double) {
-        prefs.edit().putFloat("daily_limit", limit.toFloat()).apply()
-        _dailyLimit.value = limit
     }
 }

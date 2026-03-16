@@ -62,12 +62,14 @@ class NotificationWorker(
             date = date.plusDays(1)
         }
 
-        val dailyLimit = prefs.getFloat("daily_limit", 200f).toDouble()
+        val dailyLimitRaw = prefs.getFloat("daily_limit", -1f)
+        val dailyLimit = if (dailyLimitRaw < 0) null else dailyLimitRaw.toDouble()
+        val effectiveLimit = dailyLimit ?: remaining
         val minimum = if (workingDaysLeft > 0)
-            (remaining - (workingDaysLeft - 1) * dailyLimit).coerceIn(0.0, dailyLimit)
+            (remaining - (workingDaysLeft - 1) * effectiveLimit).coerceIn(0.0, effectiveLimit)
         else 0.0
 
-        if (minimum <= 0.0 || todaySpent >= dailyLimit) {
+        if (minimum <= 0.0 || (dailyLimit != null && todaySpent >= dailyLimit)) {
             scheduleNext(hour, minute)
             return Result.success()
         }

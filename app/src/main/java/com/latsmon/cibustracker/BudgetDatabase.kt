@@ -27,11 +27,20 @@ interface SpendDao {
     @Query("SELECT * FROM spends ORDER BY timestamp DESC")
     fun getAllSpends(): Flow<List<Spend>>
 
+    @Query("SELECT * FROM spends WHERE timestamp >= :start AND timestamp < :end ORDER BY timestamp DESC")
+    fun getSpendsBetween(start: Long, end: Long): Flow<List<Spend>>
+
     @Query("SELECT COALESCE(SUM(amount), 0) FROM spends WHERE timestamp >= :startOfMonth")
     fun getTotalSpentSince(startOfMonth: Long): Flow<Double>
 
     @Query("SELECT COALESCE(SUM(amount), 0) FROM spends WHERE timestamp >= :startOfMonth")
     fun getTotalSpentSinceBlocking(startOfMonth: Long): Double
+
+    @Query("SELECT COALESCE(SUM(amount), 0) FROM spends WHERE timestamp >= :start AND timestamp < :end")
+    fun getTotalSpentBetween(start: Long, end: Long): Flow<Double>
+
+    @Query("SELECT MIN(timestamp) FROM spends")
+    fun getEarliestSpendTimestamp(): Flow<Long?>
 
     @Query("DELETE FROM spends")
     suspend fun deleteAll()

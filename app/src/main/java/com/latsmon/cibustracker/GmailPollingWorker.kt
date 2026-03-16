@@ -71,7 +71,7 @@ class GmailPollingWorker(
 }
 
 fun scheduleGmailPolling(context: Context) {
-    val request = PeriodicWorkRequestBuilder<GmailPollingWorker>(15, TimeUnit.MINUTES)
+    val request = PeriodicWorkRequestBuilder<GmailPollingWorker>(60, TimeUnit.MINUTES)
         .addTag("gmail_polling")
         .build()
 
